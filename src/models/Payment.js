@@ -8,6 +8,11 @@ const paymentSchema = new mongoose.Schema(
       required: [true, 'Order reference is required'],
       index: true
     },
+    orderNumber: {
+      type: String,
+      trim: true,
+      index: true
+    },
     orderId: {
       type: String,
       trim: true,
@@ -19,57 +24,35 @@ const paymentSchema = new mongoose.Schema(
       default: null,
       index: true
     },
-    provider: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      default: null,
-      index: true
-    },
     customerName: {
       type: String,
       default: '',
       trim: true
     },
-    providerName: {
+    customerEmail: {
+      type: String,
+      default: '',
+      trim: true
+    },
+    customerPhone: {
       type: String,
       default: '',
       trim: true
     },
     method: {
       type: String,
-      enum: ['card', 'mpesa', 'cod'],
+      enum: ['mpesa', 'card', 'cash'],
       default: 'mpesa'
     },
     status: {
       type: String,
-      enum: ['pending', 'processing', 'paid', 'failed', 'cancelled', 'refunded', 'partially_refunded', 'Pending', 'Processing', 'Paid', 'Failed', 'Refunded'],
+      enum: ['pending', 'processing', 'paid', 'failed', 'cancelled', 'refunded', 'Pending', 'Processing', 'Paid', 'Failed', 'Refunded'],
       default: 'pending',
-      index: true
-    },
-    payoutStatus: {
-      type: String,
-      enum: ['Pending', 'Processing', 'Completed', 'Failed'],
-      default: 'Pending',
       index: true
     },
     amount: {
       type: Number,
       required: [true, 'Payment amount is required'],
-      min: 0
-    },
-    commissionRate: {
-      type: Number,
-      default: 15,
-      min: 0
-    },
-    commissionAmount: {
-      type: Number,
-      default: 0,
-      min: 0
-    },
-    providerPayoutAmount: {
-      type: Number,
-      default: 0,
       min: 0
     },
     currency: {
@@ -78,7 +61,8 @@ const paymentSchema = new mongoose.Schema(
     },
     transactionId: {
       type: String,
-      sparse: true
+      sparse: true,
+      index: true
     },
     payheroReference: {
       type: String,
@@ -94,23 +78,6 @@ const paymentSchema = new mongoose.Schema(
       type: String,
       default: null
     },
-    initiatedAt: {
-      type: Date,
-      default: Date.now
-    },
-    payoutReference: {
-      type: String,
-      default: null
-    },
-    payoutProcessedAt: {
-      type: Date,
-      default: null
-    },
-    payoutProcessedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      default: null
-    },
     gatewayMeta: {
       type: mongoose.Schema.Types.Mixed,
       default: {}
@@ -122,18 +89,6 @@ const paymentSchema = new mongoose.Schema(
     failedAt: {
       type: Date,
       default: null
-    },
-    invoiceSentAt: {
-      type: Date,
-      default: null
-    },
-    invoiceReference: {
-      type: String,
-      default: null
-    },
-    invoiceData: {
-      type: mongoose.Schema.Types.Mixed,
-      default: null
     }
   },
   {
@@ -141,37 +96,7 @@ const paymentSchema = new mongoose.Schema(
   }
 );
 
-import { getOrInitSettings } from '../services/systemSettingsService.js';
-
-// Calculate commission and provider payout automatically before saving
-paymentSchema.pre('save', async function () {
-  // Always query SystemSetting on NEW payment creation to snapshot the current rate set by admin
-  if (this.isNew || typeof this.commissionRate !== 'number') {
-    try {
-      const setting = await getOrInitSettings();
-      if (setting && setting.financial && typeof setting.financial.commissionRate === 'number') {
-        this.commissionRate = setting.financial.commissionRate;
-      }
-    } catch (e) {
-      // Fallback if SystemSetting fails
-    }
-  }
-
-  const rate = typeof this.commissionRate === 'number' ? this.commissionRate : Number(process.env.PLATFORM_COMMISSION_RATE || 15);
-  this.commissionRate = rate;
-  if (rate === 0) {
-    this.commissionAmount = 0;
-    this.providerPayoutAmount = this.amount;
-  } else {
-    this.commissionAmount = Math.round((this.amount * (rate / 100)) * 100) / 100;
-    this.providerPayoutAmount = Math.round((this.amount - this.commissionAmount) * 100) / 100;
-  }
-});
-
-
-// Indexes for fast lookup & reporting
 paymentSchema.index({ createdAt: -1 });
-paymentSchema.index({ payoutStatus: 1, createdAt: -1 });
 paymentSchema.index({ status: 1, createdAt: -1 });
 
 const Payment = mongoose.models.Payment || mongoose.model('Payment', paymentSchema);

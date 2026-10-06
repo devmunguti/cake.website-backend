@@ -1,201 +1,268 @@
-import Order from '../models/Order.js';
-import Service from '../models/Service.js';
-import User from '../models/User.js';
-import Payment from '../models/Payment.js';
-import { getOrInitSettings } from '../services/systemSettingsService.js';
+import Order, { generateNextOrderRef } from '../models/Order.js';
+import Cake from '../models/Cake.js';
+import Promotion from '../models/Promotion.js';
+import SystemSetting from '../models/SystemSetting.js';
 import { createAuditLog } from '../services/auditLogService.js';
 import { notificationDispatcher } from '../services/notification/notificationDispatcher.js';
 import { NOTIFICATION_EVENTS } from '../services/notification/notificationEvents.js';
 
-// Order Status Transitions Rule Matrix
-const VALID_TRANSITIONS = {
-  Pending: ['Pickup_Scheduled', 'Cancelled'],
-  Pickup_Scheduled: ['Picked_Up', 'Cancelled'],
-  Picked_Up: ['In_Wash', 'Cancelled'],
-  In_Wash: ['Ready_For_Delivery'],
-  Ready_For_Delivery: ['Out_For_Delivery'],
-  Out_For_Delivery: ['Delivered'],
-  Delivered: [],
-  Cancelled: []
+// Order Status Transition Rules Matrix
+export const VALID_ORDER_TRANSITIONS = {
+  PENDING_PAYMENT: ['PAYMENT_CONFIRMED', 'ORDER_CONFIRMED', 'CANCELLED'],
+  PAYMENT_CONFIRMED: ['ORDER_CONFIRMED', 'PREPARING', 'CANCELLED'],
+  ORDER_CONFIRMED: ['PREPARING', 'BAKING', 'CANCELLED'],
+  PREPARING: ['BAKING', 'CANCELLED'],
+  BAKING: ['DECORATING', 'CANCELLED'],
+  DECORATING: ['READY', 'PICKUP_READY', 'CANCELLED'],
+  READY: ['OUT_FOR_DELIVERY', 'DELIVERED', 'COMPLETED', 'CANCELLED'],
+  OUT_FOR_DELIVERY: ['DELIVERED', 'COMPLETED'],
+  DELIVERED: ['COMPLETED'],
+  PICKUP_READY: ['PICKED_UP', 'COMPLETED'],
+  PICKED_UP: ['COMPLETED'],
+  COMPLETED: [],
+  CANCELLED: []
 };
 
 /**
  * POST /api/orders
- * Create new customer order, validate services server-side, calculate totals & payment snapshot.
+ * Public / Customer: Create new cake order with authoritative server-side price calculation
  */
 export const createOrder = async (req, res, next) => {
   try {
     const {
       items,
-      pickupAddress,
-      deliveryAddress,
-      pickupSlot,
-      deliverySlot,
-      notes,
-      providerId,
       customerDetails,
-      clientPhone,
-      clientEmail,
-      clientName,
-      campusLocation,
-      houseNumber,
-      coordinates,
-      liveLocationUrl
+      deliveryMethod = 'DELIVERY',
+      deliveryAddress,
+      scheduledDate,
+      scheduledTimeSlot = '10:00 AM - 12:00 PM',
+      promoCode,
+      notes
     } = req.body;
 
+    // 1. Validation
     if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ success: false, message: 'Order items are required.' });
+      return res.status(400).json({ success: false, message: 'Your cart is empty. Please add cakes to place an order.' });
     }
 
-    // Validate services from MongoDB & calculate authoritative unit prices
-    let assignedProvider = null;
+    if (!customerDetails || !customerDetails.fullName || !customerDetails.phone || !customerDetails.email) {
+      return res.status(400).json({ success: false, message: 'Customer name, phone number, and email are required.' });
+    }
 
+    if (!scheduledDate) {
+      return res.status(400).json({ success: false, message: 'Please select a delivery or pickup date.' });
+    }
+
+    // Lead time validation against system settings
+    const systemSettings = await SystemSetting.findOne().lean();
+    const minLeadHours = systemSettings?.bakeryOperations?.minimumLeadTimeHours || 24;
+    const orderDate = new Date(scheduledDate);
+    const minAllowedDate = new Date(Date.now() + minLeadHours * 60 * 60 * 1000 - 5 * 60 * 1000); // 5 min grace
+
+    if (orderDate < minAllowedDate) {
+      return res.status(400).json({
+        success: false,
+        message: `Our artisanal cakes require at least ${minLeadHours} hours preparation lead time. Please choose a date after ${minAllowedDate.toLocaleDateString()}.`
+      });
+    }
+
+    // 2. Server-side authoritative validation and price recalculation
     const processedItems = [];
+    let calculatedSubtotal = 0;
+
     for (const item of items) {
-      const targetServiceId = item.serviceId || item.service;
-      if (!targetServiceId || !targetServiceId.match(/^[0-9a-fA-F]{24}$/)) {
+      const targetCakeId = item.cakeId || item.cake;
+      if (!targetCakeId || !String(targetCakeId).match(/^[0-9a-fA-F]{24}$/)) {
+        return res.status(400).json({ success: false, message: 'Invalid cake selected.' });
+      }
+
+      const dbCake = await Cake.findById(targetCakeId);
+      if (!dbCake || !dbCake.available) {
         return res.status(400).json({
           success: false,
-          message: 'Invalid service ID provided. Please select a valid service from the catalog.'
+          message: `Cake "${item.cakeName || 'Selected cake'}" is currently unavailable or out of season.`
         });
       }
 
-      const dbService = await Service.findById(targetServiceId);
+      // Calculate unit price from base price + option adjustments
+      let unitPrice = dbCake.basePrice;
 
-      if (!dbService || !dbService.isActive) {
-        return res.status(400).json({
-          success: false,
-          message: `This service ('${item.name || targetServiceId}') is currently unavailable or inactive.`
-        });
+      // Size adjustment
+      let selectedSize = { name: '1.0 KG', weightKg: 1.0, priceAdjustment: 0 };
+      if (item.size && item.size.name) {
+        const foundSize = dbCake.sizes?.find(s => s.name === item.size.name);
+        if (foundSize) {
+          selectedSize = {
+            name: foundSize.name,
+            weightKg: foundSize.weightKg,
+            priceAdjustment: foundSize.priceAdjustment || 0
+          };
+          unitPrice += selectedSize.priceAdjustment;
+        }
       }
 
-      // Automatically derive provider from selected service unless explicitly overridden by active provider
-      if (!assignedProvider && dbService.provider) {
-        assignedProvider = dbService.provider;
+      // Flavour adjustment
+      let selectedFlavour = { name: 'Classic Vanilla', priceAdjustment: 0 };
+      if (item.flavour && item.flavour.name) {
+        const foundFlavour = dbCake.flavours?.find(f => f.name === item.flavour.name);
+        if (foundFlavour) {
+          selectedFlavour = {
+            name: foundFlavour.name,
+            priceAdjustment: foundFlavour.priceAdjustment || 0
+          };
+          unitPrice += selectedFlavour.priceAdjustment;
+        }
       }
 
-      // Set delivery fee from selected service
-      let serviceDeliveryFee = typeof dbService.deliveryFee === 'number' ? dbService.deliveryFee : 200;
+      // Filling adjustment
+      let selectedFilling = { name: 'Vanilla Buttercream', priceAdjustment: 0 };
+      if (item.filling && item.filling.name) {
+        const foundFilling = dbCake.fillings?.find(f => f.name === item.filling.name);
+        if (foundFilling) {
+          selectedFilling = {
+            name: foundFilling.name,
+            priceAdjustment: foundFilling.priceAdjustment || 0
+          };
+          unitPrice += selectedFilling.priceAdjustment;
+        }
+      }
+
+      // Decoration adjustment
+      let selectedDecoration = { name: 'Standard Piping', priceAdjustment: 0 };
+      if (item.decoration && item.decoration.name) {
+        const foundDecoration = dbCake.decorationOptions?.find(d => d.name === item.decoration.name);
+        if (foundDecoration) {
+          selectedDecoration = {
+            name: foundDecoration.name,
+            priceAdjustment: foundDecoration.priceAdjustment || 0
+          };
+          unitPrice += selectedDecoration.priceAdjustment;
+        }
+      }
+
+      const quantity = Math.max(1, parseInt(item.quantity, 10) || 1);
+      const itemTotalPrice = unitPrice * quantity;
+      calculatedSubtotal += itemTotalPrice;
 
       processedItems.push({
-        service: dbService._id,
-        name: dbService.name,
-        pricingType: dbService.pricingType,
-        unitPrice: dbService.basePrice,
-        quantity: Math.max(1, parseInt(item.quantity, 10) || 1),
-        addOns: item.addOns || [],
-        notes: item.notes || ''
+        cake: dbCake._id,
+        cakeNameSnapshot: dbCake.name,
+        cakeImageSnapshot: dbCake.images?.[0] || '',
+        quantity,
+        size: selectedSize,
+        flavour: selectedFlavour,
+        filling: selectedFilling,
+        decoration: selectedDecoration,
+        customMessage: (item.customMessage || '').trim(),
+        specialInstructions: (item.specialInstructions || '').trim(),
+        unitPrice,
+        totalPrice: itemTotalPrice
       });
-
-      var calculatedDeliveryFee = serviceDeliveryFee;
     }
 
-    // Validate assigned provider if provided explicitly
-    if (providerId) {
-      const pUser = await User.findOne({ _id: providerId, role: 'provider' });
-      if (pUser && pUser.status === 'Active') {
-        assignedProvider = pUser._id;
+    // 3. Calculate Delivery Fee & Promo Discount
+    let deliveryFee = 0;
+    if (deliveryMethod === 'DELIVERY') {
+      const defaultFee = systemSettings?.bakeryOperations?.defaultDeliveryFee ?? 350;
+      const freeThreshold = systemSettings?.bakeryOperations?.freeDeliveryThreshold ?? 6000;
+      deliveryFee = calculatedSubtotal >= freeThreshold ? 0 : defaultFee;
+    }
+
+    let discountAmount = 0;
+    let appliedPromoCode = '';
+    if (promoCode && promoCode.trim()) {
+      const promo = await Promotion.findOne({ code: promoCode.trim().toUpperCase(), isActive: true });
+      if (promo && promo.isValid(calculatedSubtotal)) {
+        appliedPromoCode = promo.code;
+        if (promo.discountType === 'percentage') {
+          discountAmount = (calculatedSubtotal * promo.discountValue) / 100;
+          if (promo.maxDiscountAmount) {
+            discountAmount = Math.min(discountAmount, promo.maxDiscountAmount);
+          }
+        } else {
+          discountAmount = Math.min(promo.discountValue, calculatedSubtotal);
+        }
+        // Increment usage count
+        promo.usageCount += 1;
+        await promo.save();
       }
     }
 
-    const customerId = req.user?.id || req.user?._id || null;
+    const grandTotal = Math.max(0, calculatedSubtotal + deliveryFee - discountAmount);
+    const orderNumber = await generateNextOrderRef();
 
-    // Resolve unified customer contact details
-    const resolvedCustomerDetails = {
-      fullName: customerDetails?.fullName || clientName || req.user?.fullName || '',
-      phone: customerDetails?.phone || clientPhone || req.user?.phone || '',
-      email: customerDetails?.email || clientEmail || req.user?.email || ''
-    };
-
-    // Resolve unified pickup address & live location
-    const coords = pickupAddress?.coordinates || coordinates;
-    const hasCoords = coords && typeof coords.lat === 'number' && typeof coords.lng === 'number';
-
-    const resolvedPickupAddress = {
-      street: pickupAddress?.street || campusLocation || 'Main Campus',
-      city: pickupAddress?.city || 'Nairobi',
-      campusLocation: pickupAddress?.campusLocation || campusLocation || '',
-      houseNumber: pickupAddress?.houseNumber || houseNumber || '',
-      instructions: pickupAddress?.instructions || notes || '',
-      coordinates: {
-        lat: hasCoords ? coords.lat : null,
-        lng: hasCoords ? coords.lng : null,
-        accuracy: coords?.accuracy || null
+    // 4. Create Order document
+    const newOrder = await Order.create({
+      orderNumber,
+      orderRef: orderNumber,
+      customer: req.user?.id || null,
+      customerDetails: {
+        fullName: customerDetails.fullName.trim(),
+        phone: customerDetails.phone.trim(),
+        email: customerDetails.email.toLowerCase().trim()
       },
-      liveLocationUrl: pickupAddress?.liveLocationUrl || liveLocationUrl || (hasCoords ? `https://maps.google.com/?q=${coords.lat},${coords.lng}` : ''),
-      locationUpdatedAt: hasCoords ? new Date() : null
-    };
-
-    const newOrder = new Order({
-      customer: customerId,
-      customerDetails: resolvedCustomerDetails,
-      provider: assignedProvider,
       items: processedItems,
-      pickupAddress: resolvedPickupAddress,
-      deliveryAddress: deliveryAddress || { street: resolvedPickupAddress.street, city: 'Nairobi' },
-      pickupSlot: pickupSlot || { date: new Date(), windowStart: '09:00', windowEnd: '11:00' },
-      deliverySlot: deliverySlot || { date: new Date(Date.now() + 86400000), windowStart: '14:00', windowEnd: '16:00' },
+      deliveryMethod,
+      deliveryAddress: deliveryMethod === 'DELIVERY' ? deliveryAddress || {} : {},
+      scheduledDate: orderDate,
+      scheduledTimeSlot: scheduledTimeSlot.trim(),
       pricing: {
-        deliveryFee: calculatedDeliveryFee !== undefined ? calculatedDeliveryFee : 200
+        subtotal: calculatedSubtotal,
+        deliveryFee,
+        discount: discountAmount,
+        promoCode: appliedPromoCode,
+        grandTotal
       },
-      notes: notes || ''
+      paymentStatus: 'PENDING',
+      orderStatus: 'PENDING_PAYMENT',
+      status: 'PENDING_PAYMENT',
+      notes: notes || '',
+      timeline: [
+        {
+          status: 'PENDING_PAYMENT',
+          timestamp: new Date(),
+          note: 'Cake order placed. Awaiting M-Pesa payment.'
+        }
+      ]
     });
 
-    await newOrder.save();
-
-    // Create initial Payment record with 'pending' status awaiting M-Pesa STK Push / COD confirmation
-    const payment = await Payment.create({
-      order: newOrder._id,
-      orderId: newOrder.orderRef,
-      customer: customerId,
-      provider: assignedProvider,
-      amount: newOrder.pricing.grandTotal,
-      status: 'pending',
-      payoutStatus: 'Pending',
-      method: 'mpesa'
-    });
-
-    // Check system settings for high-value alerts
-    const settings = await getOrInitSettings();
-    if (newOrder.pricing.grandTotal >= 10000 && settings?.notifications?.highValueOrders) {
-      await createAuditLog({
-        req,
-        user: req.user,
-        action: 'High Value Order Created',
-        details: `Alert: High-value order ${newOrder.orderRef} created (KES ${newOrder.pricing.grandTotal}).`,
-        status: 'Success',
-        category: 'Order'
-      });
-    }
-
+    // 5. Audit log
     await createAuditLog({
-      req,
-      user: req.user,
-      action: 'Order Created',
-      details: `Customer created order ${newOrder.orderRef} total KES ${newOrder.pricing.grandTotal}`,
+      user: req.user?.id || null,
+      userName: customerDetails.fullName,
+      role: req.user?.role || 'customer',
+      action: 'Order Placed',
+      details: `Placed order ${newOrder.orderNumber} for KES ${newOrder.pricing.grandTotal} (${processedItems.length} cakes)`,
+      category: 'Order',
       status: 'Success',
-      category: 'Order'
+      ipAddress: req.ip
     });
 
-    // 1. Dispatch multi-channel notification to Customer, Admin & Provider
-    notificationDispatcher.dispatch(
-      NOTIFICATION_EVENTS.ORDER_CREATED,
-      { order: newOrder, payment }
-    );
-
-    // 2. Dispatch email notification to Assigned Cleaner / Provider if present
-    if (assignedProvider) {
-      notificationDispatcher.dispatch(
-        NOTIFICATION_EVENTS.PROVIDER_ORDER_PAYMENT_CONFIRMED,
-        { order: newOrder, payment }
-      );
+    // 6. Notify customer & Admin
+    try {
+      await notificationDispatcher.dispatch({
+        event: NOTIFICATION_EVENTS.ORDER_CREATED,
+        recipient: {
+          email: customerDetails.email,
+          phone: customerDetails.phone,
+          userId: req.user?.id
+        },
+        data: {
+          orderNumber: newOrder.orderNumber,
+          customerName: customerDetails.fullName,
+          grandTotal: newOrder.pricing.grandTotal,
+          deliveryMethod: newOrder.deliveryMethod,
+          scheduledDate: newOrder.scheduledDate
+        }
+      });
+    } catch (notifErr) {
+      console.warn('⚠️ Order creation notification warning:', notifErr.message);
     }
-
 
     return res.status(201).json({
       success: true,
-      message: 'Order placed successfully',
-      data: { order: newOrder, payment }
+      message: 'Cake order created successfully.',
+      data: newOrder
     });
   } catch (error) {
     next(error);
@@ -203,97 +270,23 @@ export const createOrder = async (req, res, next) => {
 };
 
 /**
- * GET /api/orders
- * Role-based order list (Customer: own orders; Provider: assigned orders; Admin: all with filters)
+ * GET /api/orders/my-orders
+ * Customer: Get orders for authenticated user
  */
-export const getOrders = async (req, res, next) => {
+export const getCustomerOrders = async (req, res, next) => {
   try {
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 20;
-    const skip = (page - 1) * limit;
-
-    const { status, providerId, customerId, search } = req.query;
-    const query = {};
-
-    // Role Enforcement - Strict Provider & Customer Isolation
-    if (req.user.role === 'customer' || req.user.role === 'user') {
-      query.customer = req.user.id;
-    } else if (req.user.role === 'provider' || req.user.role === 'cleaner') {
-      query.provider = req.user.id;
-      // Exclude unpaid pending checkout drafts from the provider's active dashboard
-      query.$and = query.$and || [];
-      query.$and.push({
-        $or: [
-          { paymentStatus: 'Paid' },
-          { status: { $ne: 'Pending' } }
-        ]
-      });
-    } else if (req.user.role === 'admin') {
-      if (providerId) query.provider = providerId;
-      if (customerId) query.customer = customerId;
+    if (!req.user || !req.user.id) {
+      return res.status(401).json({ success: false, message: 'Please login to view your orders.' });
     }
 
-    if (status && status !== 'All') {
-      query.status = status;
-    }
-
-    if (search && search.trim() !== '') {
-      const searchRegex = new RegExp(search.trim(), 'i');
-      query.$and = query.$and || [];
-      query.$and.push({
-        $or: [{ orderRef: searchRegex }]
-      });
-    }
-
-    const [rawOrders, total] = await Promise.all([
-      Order.find(query)
-        .populate('customer', 'fullName email phone')
-        .populate('provider', 'fullName email phone providerDetails')
-        .populate('driver', 'fullName phone')
-        .populate('items.service', 'name category basePrice')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Order.countDocuments(query)
-    ]);
-
-    // Attach payment records and transactionId to each order
-    const orderIds = rawOrders.map(o => o._id);
-    const payments = await Payment.find({ order: { $in: orderIds } })
-      .select('order transactionId status method paidAt amount gatewayMeta')
+    const orders = await Order.find({ customer: req.user.id })
+      .sort({ createdAt: -1 })
       .lean();
-
-    const paymentMap = {};
-    payments.forEach(p => {
-      paymentMap[p.order.toString()] = p;
-    });
-
-    const orders = rawOrders.map(o => {
-      const p = paymentMap[o._id.toString()];
-      return {
-        ...o,
-        payment: p || null,
-        transactionId: p?.transactionId || p?.gatewayMeta?.mpesaReceiptNumber || null
-      };
-    });
-
-    const totalPages = Math.ceil(total / limit) || 1;
 
     return res.status(200).json({
       success: true,
       count: orders.length,
-      data: {
-        orders,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages,
-          hasNextPage: page < totalPages,
-          hasPreviousPage: page > 1
-        }
-      }
+      data: orders
     });
   } catch (error) {
     next(error);
@@ -301,146 +294,108 @@ export const getOrders = async (req, res, next) => {
 };
 
 /**
- * GET /api/orders/metrics
- * Computes live order statistics (Today's orders, pending pickups, ready for delivery, weekly revenue, etc.)
+ * GET /api/orders/:orderRefOrId
+ * Public / Tracking: Get order by orderNumber or ID
  */
-export const getOrderMetrics = async (req, res, next) => {
+export const getOrderByRef = async (req, res, next) => {
   try {
-    const query = {};
+    const { orderRef } = req.params;
 
-    // Role Enforcement - Strict Provider & Customer Isolation for Metrics
-    if (req.user && (req.user.role === 'provider' || req.user.role === 'cleaner')) {
-      query.provider = req.user.id;
-      query.$or = [
-        { paymentStatus: 'Paid' },
-        { status: { $ne: 'Pending' } }
-      ];
-    } else if (req.user && (req.user.role === 'customer' || req.user.role === 'user')) {
-      query.customer = req.user.id;
+    let order = null;
+    if (orderRef.match(/^[0-9a-fA-F]{24}$/)) {
+      order = await Order.findById(orderRef).populate('items.cake', 'name slug images basePrice');
+    }
+    if (!order) {
+      order = await Order.findOne({
+        $or: [{ orderNumber: orderRef }, { orderRef: orderRef }]
+      }).populate('items.cake', 'name slug images basePrice');
     }
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-
-    const startOfYesterday = new Date(startOfToday);
-    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
-
-    const endOfYesterday = new Date(startOfToday);
-    endOfYesterday.setMilliseconds(-1);
-
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-
-    // Start of current week (Monday)
-    const now = new Date();
-    const startOfWeek = new Date(now);
-    const dayOfWeek = (now.getDay() + 6) % 7; // 0 = Monday, 6 = Sunday
-    startOfWeek.setDate(now.getDate() - dayOfWeek);
-    startOfWeek.setHours(0, 0, 0, 0);
-
-    // Start of previous week
-    const startOfPrevWeek = new Date(startOfWeek);
-    startOfPrevWeek.setDate(startOfPrevWeek.getDate() - 7);
-
-    const [
-      totalOrders,
-      todayOrders,
-      yesterdayOrders,
-      pendingPickups,
-      urgentPickups,
-      inWash,
-      readyForDelivery,
-      outForDelivery,
-      delivered,
-      cancelled,
-      weeklyOrders,
-      prevWeeklyOrders
-    ] = await Promise.all([
-      Order.countDocuments(query),
-      Order.countDocuments({ ...query, createdAt: { $gte: startOfToday } }),
-      Order.countDocuments({ ...query, createdAt: { $gte: startOfYesterday, $lte: endOfYesterday } }),
-      Order.countDocuments({ ...query, status: { $in: ['Pending', 'Pickup_Scheduled'] } }),
-      Order.countDocuments({ ...query, status: { $in: ['Pending', 'Pickup_Scheduled'] }, createdAt: { $lte: twoHoursAgo } }),
-      Order.countDocuments({ ...query, status: 'In_Wash' }),
-      Order.countDocuments({ ...query, status: 'Ready_For_Delivery' }),
-      Order.countDocuments({ ...query, status: 'Out_For_Delivery' }),
-      Order.countDocuments({ ...query, status: 'Delivered' }),
-      Order.countDocuments({ ...query, status: 'Cancelled' }),
-      Order.find({ ...query, createdAt: { $gte: startOfWeek } }).select('pricing.grandTotal createdAt').lean(),
-      Order.find({ ...query, createdAt: { $gte: startOfPrevWeek, $lt: startOfWeek } }).select('pricing.grandTotal createdAt').lean()
-    ]);
-
-    // Calculate daily revenue for current week (Mon-Sun)
-    const currentWeekDaily = [0, 0, 0, 0, 0, 0, 0];
-    let currentWeekTotal = 0;
-    weeklyOrders.forEach(o => {
-      const d = new Date(o.createdAt);
-      const dIdx = (d.getDay() + 6) % 7;
-      const amt = o.pricing?.grandTotal || 0;
-      if (dIdx >= 0 && dIdx < 7) {
-        currentWeekDaily[dIdx] += amt;
-      }
-      currentWeekTotal += amt;
-    });
-
-    // Calculate daily revenue for previous week
-    const prevWeekDaily = [0, 0, 0, 0, 0, 0, 0];
-    let prevWeekTotal = 0;
-    prevWeeklyOrders.forEach(o => {
-      const d = new Date(o.createdAt);
-      const dIdx = (d.getDay() + 6) % 7;
-      const amt = o.pricing?.grandTotal || 0;
-      if (dIdx >= 0 && dIdx < 7) {
-        prevWeekDaily[dIdx] += amt;
-      }
-      prevWeekTotal += amt;
-    });
-
-    let growthFormatted = '+0%';
-    let isPositiveGrowth = true;
-
-    if (yesterdayOrders === 0) {
-      if (todayOrders > 0) {
-        growthFormatted = `+${todayOrders * 100}%`;
-        isPositiveGrowth = true;
-      } else {
-        growthFormatted = '0%';
-        isPositiveGrowth = true;
-      }
-    } else {
-      const diff = Math.round(((todayOrders - yesterdayOrders) / yesterdayOrders) * 100);
-      growthFormatted = `${diff >= 0 ? '+' : ''}${diff}%`;
-      isPositiveGrowth = diff >= 0;
-    }
-
-    // Revenue growth %
-    let revenueGrowth = '+0%';
-    if (prevWeekTotal === 0) {
-      revenueGrowth = currentWeekTotal > 0 ? '+100%' : '0%';
-    } else {
-      const rDiff = Math.round(((currentWeekTotal - prevWeekTotal) / prevWeekTotal) * 100);
-      revenueGrowth = `${rDiff >= 0 ? '+' : ''}${rDiff}%`;
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Cake order not found' });
     }
 
     return res.status(200).json({
       success: true,
-      data: {
-        todayOrders,
-        yesterdayOrders,
-        growthFormatted,
-        isPositiveGrowth,
-        pendingPickups,
-        urgentPickups,
-        inWash,
-        readyForDelivery,
-        outForDelivery,
-        delivered,
-        cancelled,
-        totalOrders,
-        currentWeekTotal,
-        prevWeekTotal,
-        revenueGrowth,
-        currentWeekDaily,
-        prevWeekDaily
+      data: order
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/admin/orders
+ * Admin: Paginated order management with search and filters
+ */
+export const getAdminOrders = async (req, res, next) => {
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      orderStatus,
+      paymentStatus,
+      deliveryMethod,
+      search,
+      startDate,
+      endDate
+    } = req.query;
+
+    const query = {};
+
+    if (orderStatus && orderStatus !== 'All') {
+      query.$or = [{ orderStatus }, { status: orderStatus }];
+    }
+    if (paymentStatus && paymentStatus !== 'All') {
+      query.paymentStatus = paymentStatus.toUpperCase();
+    }
+    if (deliveryMethod && deliveryMethod !== 'All') {
+      query.deliveryMethod = deliveryMethod.toUpperCase();
+    }
+
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) query.createdAt.$gte = new Date(startDate);
+      if (endDate) query.createdAt.$lte = new Date(endDate);
+    }
+
+    if (search && search.trim()) {
+      const searchRegex = new RegExp(search.trim(), 'i');
+      query.$or = [
+        { orderNumber: searchRegex },
+        { orderRef: searchRegex },
+        { 'customerDetails.fullName': searchRegex },
+        { 'customerDetails.phone': searchRegex },
+        { 'customerDetails.email': searchRegex }
+      ];
+    }
+
+    const currentPage = Math.max(1, parseInt(page, 10) || 1);
+    const pageLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 20));
+    const skip = (currentPage - 1) * pageLimit;
+
+    const [orders, total] = await Promise.all([
+      Order.find(query)
+        .populate('customer', 'fullName email phone')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageLimit)
+        .lean(),
+      Order.countDocuments(query)
+    ]);
+
+    const totalPages = Math.ceil(total / pageLimit) || 1;
+
+    return res.status(200).json({
+      success: true,
+      data: orders,
+      pagination: {
+        page: currentPage,
+        limit: pageLimit,
+        total,
+        totalPages,
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1
       }
     });
   } catch (error) {
@@ -449,192 +404,86 @@ export const getOrderMetrics = async (req, res, next) => {
 };
 
 /**
- * GET /api/orders/:id
+ * PATCH /api/admin/orders/:id/status
+ * Admin: Update bakery order status with state machine enforcement
  */
-export const getOrderById = async (req, res, next) => {
+export const updateOrderStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const cleanId = (id || '').trim();
+    const { status, note } = req.body;
 
-    const query = {
-      $or: [
-        { orderRef: cleanId },
-        { orderRef: `ORD-${cleanId.replace(/^ORD-/i, '')}` },
-        ...(cleanId.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: cleanId }] : [])
-      ]
-    };
-
-    const order = await Order.findOne(query)
-      .populate('customer', 'fullName email phone')
-      .populate('provider', 'fullName email phone providerDetails')
-      .populate('driver', 'fullName phone')
-      .populate('items.service')
-      .lean();
-
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found.' });
+    if (!status) {
+      return res.status(400).json({ success: false, message: 'Target order status is required.' });
     }
 
-    // IDOR Security Check - Multi-tenancy enforcement
-    if (req.user.role === 'customer' && order.customer && order.customer._id.toString() !== req.user.id) {
-      return res.status(403).json({ success: false, message: 'Access denied to this order.' });
-    }
-    if ((req.user.role === 'provider' || req.user.role === 'cleaner') && order.provider && order.provider._id.toString() !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ success: false, message: 'Access denied to this order.' });
-    }
-
-    // Attach payment info
-    const payment = await Payment.findOne({ order: order._id }).lean();
-    const enrichedOrder = {
-      ...order,
-      payment: payment || null,
-      transactionId: payment?.transactionId || payment?.gatewayMeta?.mpesaReceiptNumber || null
-    };
-
-    return res.status(200).json({ success: true, data: enrichedOrder });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * PATCH /api/orders/:id/assign-provider
- * Admin endpoint to assign an order to an active cleaner/provider
- */
-export const assignOrderProvider = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { providerId } = req.body;
-
-    if (!providerId) {
-      return res.status(400).json({ success: false, message: 'Provider ID is required.' });
-    }
-
-    const provider = await User.findOne({ _id: providerId, role: 'provider' });
-    if (!provider || provider.status !== 'Active') {
-      return res.status(400).json({
-        success: false,
-        message: 'Selected provider is invalid or not active.'
-      });
-    }
-
+    const targetStatus = status.toUpperCase();
     const order = await Order.findById(id);
     if (!order) {
       return res.status(404).json({ success: false, message: 'Order not found.' });
     }
 
-    order.provider = provider._id;
-    if (order.status === 'Pending') {
-      order.status = 'Pickup_Scheduled';
-    }
-    await order.save();
+    const currentStatus = (order.orderStatus || order.status || 'PENDING_PAYMENT').toUpperCase();
 
-    // Sync Payment provider reference
-    await Payment.findOneAndUpdate({ order: order._id }, { provider: provider._id });
-
-    await createAuditLog({
-      req,
-      user: req.user,
-      action: 'Order Provider Assigned',
-      details: `Assigned Order ${order.orderRef} to provider '${provider.fullName}' (${provider.providerDetails?.businessName || provider.email})`,
-      status: 'Success',
-      category: 'Order'
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: `Order assigned to ${provider.fullName} successfully.`,
-      data: order
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * PATCH /api/orders/:id/status
- * Controlled order status updates (Provider or Admin)
- */
-export const updateOrderStatus = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-
-    const allowedStatuses = [
-      'Pending',
-      'Pickup_Scheduled',
-      'Picked_Up',
-      'In_Wash',
-      'Ready_For_Delivery',
-      'Out_For_Delivery',
-      'Delivered',
-      'Cancelled'
-    ];
-
-    if (!status || !allowedStatuses.includes(status)) {
+    // Validate transition
+    const allowedTransitions = VALID_ORDER_TRANSITIONS[currentStatus] || [];
+    if (!allowedTransitions.includes(targetStatus) && targetStatus !== currentStatus) {
       return res.status(400).json({
         success: false,
-        message: `Invalid status '${status}'. Must be one of: ${allowedStatuses.join(', ')}`
+        message: `Invalid order state transition from ${currentStatus} to ${targetStatus}. Allowed next states: [${allowedTransitions.join(', ')}]`
       });
     }
 
-    let order = null;
-    if (id.match(/^[0-9a-fA-F]{24}$/)) {
-      order = await Order.findById(id);
-    }
-    if (!order) {
-      order = await Order.findOne({ orderRef: id });
-    }
+    order.orderStatus = targetStatus;
+    order.status = targetStatus;
 
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found.' });
-    }
-
-    // Role ownership check for provider/cleaner
-    if (req.user && (req.user.role === 'provider' || req.user.role === 'cleaner')) {
-      if (order.provider && order.provider.toString() !== req.user.id && req.user.role !== 'admin') {
-        return res.status(403).json({ success: false, message: 'You can only update your assigned orders.' });
-      }
-      // If order was unassigned, assign this provider when they take action
-      if (!order.provider) {
-        order.provider = req.user.id;
-        await Payment.findOneAndUpdate({ order: order._id }, { provider: req.user.id });
+    if (targetStatus === 'PAYMENT_CONFIRMED' || targetStatus === 'COMPLETED' || targetStatus === 'DELIVERED') {
+      if (order.paymentStatus === 'PENDING' && targetStatus !== 'CANCELLED') {
+        order.paymentStatus = 'PAID';
       }
     }
 
-    const oldStatus = order.status;
-    order.status = status;
+    order.timeline.push({
+      status: targetStatus,
+      timestamp: new Date(),
+      note: note || `Order status updated to ${targetStatus}`
+    });
+
     await order.save();
 
     await createAuditLog({
-      req,
-      user: req.user || { role: 'System', fullName: 'Order Manager' },
+      user: req.user?.id,
+      userName: req.user?.fullName || 'Admin',
+      role: req.user?.role || 'admin',
       action: 'Order Status Changed',
-      details: `Order ${order.orderRef} status updated from '${oldStatus}' to '${status}'`,
+      details: `Changed status of order ${order.orderNumber} from ${currentStatus} to ${targetStatus}`,
+      category: 'Order',
       status: 'Success',
-      category: 'Order'
+      ipAddress: req.ip
     });
 
-    // Dispatch Customer & Provider Lifecycle Notification
-    if (oldStatus !== status) {
-      const statusEventMap = {
-        Pickup_Scheduled: NOTIFICATION_EVENTS.ORDER_PICKUP_SCHEDULED,
-        Picked_Up: NOTIFICATION_EVENTS.ORDER_PICKED_UP,
-        In_Wash: NOTIFICATION_EVENTS.ORDER_IN_WASH,
-        Ready_For_Delivery: NOTIFICATION_EVENTS.ORDER_READY_FOR_DELIVERY,
-        Out_For_Delivery: NOTIFICATION_EVENTS.ORDER_OUT_FOR_DELIVERY,
-        Delivered: NOTIFICATION_EVENTS.ORDER_DELIVERED,
-        Cancelled: NOTIFICATION_EVENTS.ORDER_CANCELLED
-      };
-
-      const targetEvent = statusEventMap[status] || NOTIFICATION_EVENTS.ORDER_STATUS_UPDATED;
-      notificationDispatcher.dispatch(targetEvent, { order, status, oldStatus });
+    // Send customer notification for milestone states
+    try {
+      await notificationDispatcher.dispatch({
+        event: NOTIFICATION_EVENTS.ORDER_STATUS_UPDATED,
+        recipient: {
+          email: order.customerDetails?.email,
+          phone: order.customerDetails?.phone,
+          userId: order.customer
+        },
+        data: {
+          orderNumber: order.orderNumber,
+          customerName: order.customerDetails?.fullName,
+          newStatus: targetStatus,
+          note: note || ''
+        }
+      });
+    } catch (notifErr) {
+      console.warn('⚠️ Order status notification warning:', notifErr.message);
     }
-
 
     return res.status(200).json({
       success: true,
-      message: `Order status updated to ${status}`,
+      message: `Order status successfully updated to ${targetStatus}`,
       data: order
     });
   } catch (error) {
@@ -643,243 +492,67 @@ export const updateOrderStatus = async (req, res, next) => {
 };
 
 /**
- * GET /api/orders/track/:orderRef
- * Purpose-built order tracking endpoint for customer, provider, and guest tracking.
- * Returns order tracking DTO with safe customer and payment status.
+ * GET /api/admin/orders/dashboard-stats
+ * Admin: Real-time bakery overview KPIs and analytics
  */
-export const getOrderTracking = async (req, res, next) => {
+export const getAdminDashboardStats = async (req, res, next) => {
   try {
-    const { orderRef } = req.params;
-    const cleanRef = (orderRef || '').trim();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    // 1. First try finding directly by orderRef or _id
-    let order = await Order.findOne({
-      $or: [
-        { orderRef: cleanRef },
-        { orderRef: `ORD-${cleanRef.replace(/^ORD-/i, '')}` },
-        ...(cleanRef.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: cleanRef }] : [])
-      ]
-    })
-      .populate('customer', 'fullName email phone')
-      .populate('provider', 'fullName providerDetails.businessName providerDetails.tillNumber')
-      .populate('items.service', 'name category')
-      .lean();
+    const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
-    // 2. If not found by orderRef, search by Payment transactionId (M-Pesa Receipt Code)
-    if (!order) {
-      const paymentByCode = await Payment.findOne({
-        $or: [
-          { transactionId: { $regex: new RegExp(`^${cleanRef}$`, 'i') } },
-          { 'gatewayMeta.mpesaReceiptNumber': { $regex: new RegExp(`^${cleanRef}$`, 'i') } }
-        ]
-      }).lean();
+    const [
+      todayOrdersCount,
+      pendingOrdersCount,
+      bakingCount,
+      readyCount,
+      completedOrdersCount,
+      todayRevenueAgg,
+      monthlyRevenueAgg,
+      totalCustomersCount,
+      popularCakesAgg
+    ] = await Promise.all([
+      Order.countDocuments({ createdAt: { $gte: today } }),
+      Order.countDocuments({ orderStatus: { $in: ['PENDING_PAYMENT', 'ORDER_CONFIRMED', 'PAYMENT_CONFIRMED'] } }),
+      Order.countDocuments({ orderStatus: { $in: ['PREPARING', 'BAKING', 'DECORATING'] } }),
+      Order.countDocuments({ orderStatus: { $in: ['READY', 'PICKUP_READY', 'OUT_FOR_DELIVERY'] } }),
+      Order.countDocuments({ orderStatus: { $in: ['DELIVERED', 'PICKED_UP', 'COMPLETED'] } }),
+      Order.aggregate([
+        { $match: { paymentStatus: 'PAID', createdAt: { $gte: today } } },
+        { $group: { _id: null, total: { $sum: '$pricing.grandTotal' } } }
+      ]),
+      Order.aggregate([
+        { $match: { paymentStatus: 'PAID', createdAt: { $gte: startOfMonth } } },
+        { $group: { _id: null, total: { $sum: '$pricing.grandTotal' } } }
+      ]),
+      Order.distinct('customerDetails.email').then(arr => arr.length),
+      Order.aggregate([
+        { $unwind: '$items' },
+        { $group: { _id: '$items.cakeNameSnapshot', count: { $sum: '$items.quantity' }, revenue: { $sum: '$items.totalPrice' } } },
+        { $sort: { count: -1 } },
+        { $limit: 5 }
+      ])
+    ]);
 
-      if (paymentByCode && paymentByCode.order) {
-        order = await Order.findById(paymentByCode.order)
-          .populate('customer', 'fullName email phone')
-          .populate('provider', 'fullName providerDetails.businessName providerDetails.tillNumber')
-          .populate('items.service', 'name category')
-          .lean();
-      }
-    }
-
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found. Please verify your order number or M-Pesa transaction code.' });
-    }
-
-    const userId = req.user?.id;
-    const userRole = req.user?.role;
-    const isAdmin = userRole === 'admin';
-    const isOwnerCustomer = userRole === 'customer' && order.customer && order.customer._id?.toString() === userId;
-    const isAssignedProvider = (userRole === 'provider' || userRole === 'cleaner') && order.provider && order.provider._id?.toString() === userId;
-
-    // ── Fetch associated payment record ───────────────────────────────────────
-    const payment = await Payment.findOne({ order: order._id })
-      .select('status method transactionId paidAt amount failureReason')
-      .lean();
-
-    // ── Build the tracking DTO ────────────────────────────────────────────────
-    const providerInfo = order.provider ? {
-      name: order.provider.providerDetails?.businessName || order.provider.fullName || 'Assigned Provider',
-      tillNumber: isAdmin ? (order.provider.providerDetails?.tillNumber || null) : undefined
-    } : null;
-
-    const customerName = order.customerDetails?.fullName || order.customer?.fullName || 'Verified Customer';
-    const customerPhone = order.customerDetails?.phone || order.customer?.phone || payment?.phoneNumber || '';
-    const customerEmail = order.customerDetails?.email || order.customer?.email || '';
-
-    const customerInfo = (isAdmin || isOwnerCustomer || isAssignedProvider) ? {
-      name: customerName,
-      phone: customerPhone || undefined,
-      email: customerEmail || undefined
-    } : {
-      name: customerName ? customerName.split(' ')[0] + ' ***' : 'Customer'
-    };
-
-    const trackingDto = {
-      orderRef: order.orderRef,
-      status: order.status,
-      paymentStatus: order.paymentStatus || 'Pending',
-      createdAt: order.createdAt,
-      updatedAt: order.updatedAt,
-      service: {
-        name: order.items?.[0]?.name || 'Laundry Service',
-        category: order.items?.[0]?.service?.category || null,
-        quantity: order.items?.[0]?.quantity || 1
-      },
-      pricing: {
-        grandTotal: order.pricing?.grandTotal || 0,
-        deliveryFee: order.pricing?.deliveryFee || 0,
-        subtotal: order.pricing?.subtotal || 0
-      },
-      provider: providerInfo,
-      customer: customerInfo,
-      customerDetails: {
-        fullName: customerName,
-        phone: (isAdmin || isOwnerCustomer || isAssignedProvider) ? customerPhone : undefined,
-        email: (isAdmin || isOwnerCustomer || isAssignedProvider) ? customerEmail : undefined
-      },
-      pickupAddress: order.pickupAddress || null,
-      deliveryAddress: order.deliveryAddress || null,
-      providerLiveLocation: order.providerLiveLocation || null,
-      payment: payment ? {
-        status: payment.status,
-        method: payment.method || 'mpesa',
-        transactionId: payment.transactionId || null,
-        paidAt: payment.paidAt || null,
-        amount: payment.amount || 0,
-        failureReason: (isAdmin || isOwnerCustomer) ? (payment.failureReason || null) : undefined
-      } : null
-    };
+    const todayRevenue = todayRevenueAgg[0]?.total || 0;
+    const monthlyRevenue = monthlyRevenueAgg[0]?.total || 0;
 
     return res.status(200).json({
       success: true,
-      data: trackingDto
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * PATCH /api/orders/:orderRef/live-location
- * Customer updates their real-time GPS coordinates / map navigation link / house details
- */
-export const updateOrderLiveLocation = async (req, res, next) => {
-  try {
-    const { orderRef } = req.params;
-    const { coordinates, liveLocationUrl, houseNumber, instructions, campusLocation } = req.body;
-
-    const cleanRef = (orderRef || '').trim();
-    const order = await Order.findOne({
-      $or: [
-        { orderRef: cleanRef },
-        { orderRef: `ORD-${cleanRef.replace(/^ORD-/i, '')}` },
-        ...(cleanRef.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: cleanRef }] : [])
-      ]
-    });
-
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found.' });
-    }
-
-    order.pickupAddress = order.pickupAddress || { street: 'Nairobi', city: 'Nairobi' };
-
-    if (coordinates && typeof coordinates.lat === 'number' && typeof coordinates.lng === 'number') {
-      order.pickupAddress.coordinates = {
-        lat: coordinates.lat,
-        lng: coordinates.lng,
-        accuracy: coordinates.accuracy || null
-      };
-      order.pickupAddress.liveLocationUrl = liveLocationUrl || `https://maps.google.com/?q=${coordinates.lat},${coordinates.lng}`;
-      order.pickupAddress.locationUpdatedAt = new Date();
-    } else if (liveLocationUrl) {
-      order.pickupAddress.liveLocationUrl = liveLocationUrl;
-      order.pickupAddress.locationUpdatedAt = new Date();
-    }
-
-    if (houseNumber !== undefined) {
-      order.pickupAddress.houseNumber = houseNumber.trim();
-    }
-    if (campusLocation !== undefined) {
-      order.pickupAddress.campusLocation = campusLocation.trim();
-      order.pickupAddress.street = campusLocation.trim();
-    }
-    if (instructions !== undefined) {
-      order.pickupAddress.instructions = instructions.trim();
-    }
-
-    order.markModified('pickupAddress');
-    await order.save();
-
-    return res.status(200).json({
-      success: true,
-      message: 'Live location updated successfully.',
       data: {
-        orderRef: order.orderRef,
-        pickupAddress: order.pickupAddress
+        todayOrdersCount,
+        pendingOrdersCount,
+        bakingCount,
+        readyCount,
+        completedOrdersCount,
+        todayRevenue,
+        monthlyRevenue,
+        totalCustomersCount,
+        popularCakes: popularCakesAgg
       }
     });
   } catch (error) {
     next(error);
   }
 };
-
-/**
- * PATCH /api/orders/:id/provider-location
- * Provider updates their live moving coordinates, heading, speed, and navigation state
- */
-export const updateProviderLiveLocation = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { coordinates, isNavigating, currentLeg } = req.body;
-
-    const cleanId = (id || '').trim();
-    const order = await Order.findOne({
-      $or: [
-        { orderRef: cleanId },
-        { orderRef: `ORD-${cleanId.replace(/^ORD-/i, '')}` },
-        ...(cleanId.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: cleanId }] : [])
-      ]
-    });
-
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found.' });
-    }
-
-    order.providerLiveLocation = order.providerLiveLocation || {};
-
-    if (coordinates && typeof coordinates.lat === 'number' && typeof coordinates.lng === 'number') {
-      order.providerLiveLocation.coordinates = {
-        lat: coordinates.lat,
-        lng: coordinates.lng,
-        accuracy: coordinates.accuracy ?? null,
-        heading: coordinates.heading ?? null,
-        speed: coordinates.speed ?? null
-      };
-      order.providerLiveLocation.updatedAt = new Date();
-    }
-
-    if (isNavigating !== undefined) {
-      order.providerLiveLocation.isNavigating = !!isNavigating;
-    }
-    if (currentLeg && ['pickup', 'delivery'].includes(currentLeg)) {
-      order.providerLiveLocation.currentLeg = currentLeg;
-    }
-
-    order.markModified('providerLiveLocation');
-    await order.save();
-
-    return res.status(200).json({
-      success: true,
-      message: 'Provider live location updated.',
-      data: {
-        orderRef: order.orderRef,
-        providerLiveLocation: order.providerLiveLocation
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-

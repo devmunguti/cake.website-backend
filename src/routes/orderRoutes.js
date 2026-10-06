@@ -1,42 +1,25 @@
-import { Router } from 'express';
+import express from 'express';
 import {
   createOrder,
-  getOrders,
-  getOrderById,
-  getOrderMetrics,
-  assignOrderProvider,
+  getCustomerOrders,
+  getOrderByRef,
+  getAdminOrders,
   updateOrderStatus,
-  getOrderTracking,
-  updateOrderLiveLocation,
-  updateProviderLiveLocation
+  getAdminDashboardStats
 } from '../controllers/orderController.js';
-import { authenticate, optionalAuthenticate } from '../middleware/authMiddleware.js';
-import { authorizeRoles } from '../middleware/roleMiddleware.js';
-import { requirePasswordChangeCompleted } from '../middleware/passwordChangeMiddleware.js';
+import { authenticate, authorizeRoles, optionalAuthenticate } from '../middleware/authMiddleware.js';
 
-const router = Router();
+const router = express.Router();
 
-// Public order tracking — accessible to logged-in users and guests
-// Must be before the authenticate middleware block
-router.get('/track/:orderRef', optionalAuthenticate, getOrderTracking);
-router.patch('/track/:orderRef/live-location', optionalAuthenticate, updateOrderLiveLocation);
-router.patch('/:orderRef/live-location', optionalAuthenticate, updateOrderLiveLocation);
-
-// Provider live location streaming during navigation (supports both authenticated provider & track ref)
-router.patch('/track/:orderRef/provider-location', optionalAuthenticate, updateProviderLiveLocation);
-
-// Guest/Unauthenticated Checkout route for order placement
+// Customer / Public routes
 router.post('/', optionalAuthenticate, createOrder);
+router.get('/my-orders', authenticate, getCustomerOrders);
+router.get('/track/:orderRef', getOrderByRef);
+router.get('/:orderRef', optionalAuthenticate, getOrderByRef);
 
-// Authenticated order management endpoints
-router.use(authenticate, requirePasswordChangeCompleted);
-
-router.get('/metrics', getOrderMetrics);
-router.get('/', getOrders);
-router.get('/:id', getOrderById);
-router.patch('/:id/assign-provider', authorizeRoles('admin'), assignOrderProvider);
-router.patch('/:id/status', updateOrderStatus);
-router.patch('/:id/provider-location', authorizeRoles('provider', 'cleaner', 'admin'), updateProviderLiveLocation);
+// Admin routes
+router.get('/admin/dashboard-stats', authenticate, authorizeRoles('admin'), getAdminDashboardStats);
+router.get('/admin/all', authenticate, authorizeRoles('admin'), getAdminOrders);
+router.patch('/admin/:id/status', authenticate, authorizeRoles('admin'), updateOrderStatus);
 
 export default router;
-

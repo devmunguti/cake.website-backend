@@ -6,32 +6,34 @@ const reviewSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Order',
       required: true,
-      unique: true
+      index: true
     },
-    orderRef: {
+    orderNumber: {
       type: String,
       required: true,
       index: true
     },
-    provider: {
+    cake: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
+      ref: 'Cake',
+      default: null,
       index: true
+    },
+    cakeName: {
+      type: String,
+      default: 'Artisanal Cake',
+      trim: true
     },
     customer: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      default: null
+      default: null,
+      index: true
     },
     customerName: {
       type: String,
       required: true,
       trim: true
-    },
-    customerPhone: {
-      type: String,
-      default: ''
     },
     rating: {
       type: Number,
@@ -43,19 +45,29 @@ const reviewSchema = new mongoose.Schema(
       type: String,
       default: '',
       trim: true,
-      maxlength: 1000
+      maxlength: 1500
     },
-    tags: {
+    images: {
       type: [String],
       default: []
     },
-    reply: {
+    occasion: {
+      type: String,
+      default: 'Birthday',
+      trim: true
+    },
+    adminReply: {
       text: { type: String, default: null },
       repliedAt: { type: Date, default: null }
     },
     isPublished: {
       type: Boolean,
-      default: true
+      default: true,
+      index: true
+    },
+    isFeatured: {
+      type: Boolean,
+      default: false
     }
   },
   {
@@ -63,9 +75,8 @@ const reviewSchema = new mongoose.Schema(
   }
 );
 
-// Compound index for provider rating queries
-reviewSchema.index({ provider: 1, createdAt: -1 });
+reviewSchema.index({ cake: 1, isPublished: 1, createdAt: -1 });
+reviewSchema.index({ isPublished: 1, createdAt: -1 });
 
-const Review = mongoose.model('Review', reviewSchema);
-
+const Review = mongoose.models.Review || mongoose.model('Review', reviewSchema);
 export default Review;

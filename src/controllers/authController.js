@@ -1,17 +1,9 @@
 import User from '../models/User.js';
-import Service from '../models/Service.js';
-import PromotionRequest from '../models/PromotionRequest.js';
 import Order from '../models/Order.js';
-import Payment from '../models/Payment.js';
-import Ticket from '../models/Ticket.js';
-import Review from '../models/Review.js';
 import { generateAccessToken } from '../utils/generateToken.js';
 import { createAuditLog } from '../services/auditLogService.js';
-import { getOrInitSettings } from '../services/systemSettingsService.js';
 import { notificationDispatcher } from '../services/notification/notificationDispatcher.js';
 import { NOTIFICATION_EVENTS } from '../services/notification/notificationEvents.js';
-import { requestPhoneOtp, verifyPhoneOtp } from '../services/otpService.js';
-import { normalizePhoneNumber, maskPhoneNumber } from '../utils/phoneUtils.js';
 
 // Password Strength Validator (min 8 chars, 1 uppercase, 1 lowercase, 1 number, 1 special char)
 const validatePasswordStrength = (password) => {
@@ -21,7 +13,7 @@ const validatePasswordStrength = (password) => {
   const hasNumber = /[0-9]/.test(password);
   const hasSpecial = /[^A-Za-z0-9]/.test(password);
 
-  if (password.length < minLength) {
+  if (!password || password.length < minLength) {
     return 'Password must be at least 8 characters long.';
   }
   if (!hasUpper) {
@@ -42,142 +34,83 @@ const validatePasswordStrength = (password) => {
 // Cookie Options Helper (7 Days persistent session with Cross-Origin support)
 const getCookieOptions = () => ({
   httpOnly: true,
-  secure: true,
-  sameSite: 'none',
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
   maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
 });
 
+/**
+ * POST /api/auth/register
+ */
 export const register = async (req, res, next) => {
   try {
-    const { firstName, lastName, name, email, password, phone, role = 'user' } = req.body;
+    const { firstName, lastName, name, email, password, phone, role = 'customer' } = req.body;
 
-    // 1. Validation
     if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email and password are required.'
-      });
+      return res.status(400).json({ success: false, message: 'Email and password are required.' });
     }
 
     const passwordError = validatePasswordStrength(password);
     if (passwordError) {
-      return res.status(400).json({
-        success: false,
-        message: passwordError
-      });
+      return res.status(400).json({ success: false, message: passwordError });
     }
 
-    // 2. Normalize email
     const normalizedEmail = email.toLowerCase().trim();
-
-    // 3. Check existing user
     const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message: 'An account with this email address already exists.'
-      });
+      return res.status(409).json({ success: false, message: 'An account with this email already exists.' });
     }
 
-    // Derive names
     let fName = firstName;
     let lName = lastName;
-
     if (!fName && name) {
       const parts = name.trim().split(' ');
       fName = parts[0];
       lName = parts.slice(1).join(' ') || '';
     }
 
-    const isCleaner = ['provider', 'cleaner'].includes(role);
+    const userRole = role === 'admin' ? 'admin' : 'customer';
 
-    // 4. Create User in MongoDB
     const newUser = await User.create({
-      firstName: fName || 'User',
+      firstName: fName || 'Customer',
       lastName: lName || '',
       fullName: name || `${fName || ''} ${lName || ''}`.trim(),
       email: normalizedEmail,
       phone: phone || '',
       passwordHash: password,
-      role: ['user', 'customer', 'driver', 'provider', 'admin'].includes(role) ? role : 'user',
-      status: isCleaner ? 'Pending' : 'Active',
-      isActive: !isCleaner,
-      isEmailVerified: false,
-      providerDetails: isCleaner ? {
-        businessName: name || `${fName || ''} ${lName || ''}`.trim(),
-        commissionRate: 15,
-        isApproved: false,
-        rating: 5.0,
-        paymentChannels: []
-      } : undefined
+      role: userRole,
+      status: 'Active',
+      isActive: true,
+      lastLogin: new Date()
     });
 
-    // Audit log: Registration
-    await createAuditLog({
-      req,
-      user: newUser,
-      action: isCleaner ? 'Cleaner Registered (Pending Approval)' : 'User Registered',
-      details: isCleaner
-        ? `New cleaner application registered for ${newUser.email} (Pending Admin Approval)`
-        : `New ${newUser.role} account created for ${newUser.email}`,
-      status: 'Success',
-      category: 'Authentication'
-    });
-
-    // System Settings Check: Alert for cleaner/provider registrations
-    if (isCleaner) {
-      const settings = await getOrInitSettings();
-      if (settings?.notifications?.newCleanerRegistrations) {
-        await createAuditLog({
-          req,
-          user: newUser,
-          action: 'New Cleaner Alert',
-          details: `System Alert: A new laundry cleaner (${newUser.fullName} - ${newUser.email}) registered and is awaiting approval.`,
-          status: 'Success',
-          category: 'System'
-        });
-      }
-
-      // Dispatch Admin Notification for new cleaner registration
-      notificationDispatcher.dispatch(
-        NOTIFICATION_EVENTS.ADMIN_PROVIDER_REGISTRATION_PENDING,
-        { provider: newUser }
-      );
-
-      // Do NOT issue login token for pending cleaners
-      return res.status(201).json({
-        success: true,
-        requiresApproval: true,
-        message: 'Registration submitted successfully! Your account is pending administrator verification before you can access the portal.',
-        user: {
-          id: newUser._id,
-          fullName: newUser.fullName,
-          email: newUser.email,
-          role: newUser.role,
-          status: 'Pending',
-          isApproved: false
-        }
-      });
-    }
-
-    // 5. Generate token and set HttpOnly Cookie for standard users/customers
     const token = generateAccessToken(newUser);
     res.cookie('accessToken', token, getCookieOptions());
 
-    // 6. Return safe user payload (never return password)
+    await createAuditLog({
+      user: newUser._id,
+      userName: newUser.fullName,
+      role: newUser.role,
+      action: 'User Registered',
+      details: `New customer account registered: ${newUser.email}`,
+      category: 'Authentication',
+      status: 'Success',
+      ipAddress: req.ip
+    });
+
     return res.status(201).json({
       success: true,
-      token,
-      message: 'Account created successfully',
+      message: 'Account registered successfully!',
       user: {
         id: newUser._id,
+        _id: newUser._id,
+        email: newUser.email,
+        fullName: newUser.fullName,
         firstName: newUser.firstName,
         lastName: newUser.lastName,
-        fullName: newUser.fullName,
-        email: newUser.email,
+        phone: newUser.phone,
         role: newUser.role,
-        isActive: newUser.isActive,
-        isEmailVerified: newUser.isEmailVerified
+        status: newUser.status
       }
     });
   } catch (error) {
@@ -185,145 +118,63 @@ export const register = async (req, res, next) => {
   }
 };
 
+/**
+ * POST /api/auth/login
+ */
 export const login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Please provide email and password.'
-      });
+      return res.status(400).json({ success: false, message: 'Email and password are required.' });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-
-    // Find user (explicitly include passwordHash for checking)
     const user = await User.findOne({ email: normalizedEmail }).select('+passwordHash');
-    if (!user) {
-      // Audit log: Failed Login (user not found)
-      await createAuditLog({
-        req,
-        user: null,
-        action: 'Failed Login',
-        details: `Invalid email or password for ${normalizedEmail}`,
-        status: 'Failed',
-        category: 'Authentication'
-      });
 
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password.'
-      });
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }
 
-    // Cleaner / Provider Approval & Account Status Verification
-    if (['provider', 'cleaner'].includes(user.role)) {
-      if (user.status === 'Pending' || user.providerDetails?.isApproved === false) {
-        await createAuditLog({
-          req,
-          user,
-          action: 'Login Blocked (Pending Approval)',
-          details: `Cleaner ${normalizedEmail} attempted login while status is Pending Approval`,
-          status: 'Failed',
-          category: 'Authentication'
-        });
-
-        return res.status(403).json({
-          success: false,
-          code: 'PENDING_APPROVAL',
-          message: 'Your cleaner account is pending administrator approval. Please wait for the administrator to review and activate your cleaner profile.'
-        });
-      }
-
-      if (user.status === 'Suspended' || user.status === 'Rejected' || !user.isActive) {
-        await createAuditLog({
-          req,
-          user,
-          action: 'Login Blocked (Account Suspended/Inactive)',
-          details: `Cleaner ${normalizedEmail} attempted login while status is ${user.status || 'Inactive'}`,
-          status: 'Failed',
-          category: 'Authentication'
-        });
-
-        return res.status(403).json({
-          success: false,
-          code: 'ACCOUNT_SUSPENDED',
-          message: user.status === 'Suspended'
-            ? 'Your cleaner account has been suspended by the administrator. Please contact support.'
-            : 'Your cleaner account has been deactivated. Please contact support to reactivate your listing.'
-        });
-      }
-    } else if (!user.isActive || user.status === 'Suspended' || user.status === 'Rejected') {
-      await createAuditLog({
-        req,
-        user,
-        action: 'Failed Login',
-        details: `Attempted login on disabled/suspended account (${normalizedEmail})`,
-        status: 'Failed',
-        category: 'Authentication'
-      });
-
-      return res.status(403).json({
-        success: false,
-        message: user.status === 'Suspended'
-          ? 'Account has been suspended. Please contact support.'
-          : 'Account has been disabled. Please contact support.'
-      });
+    if (!user.isActive || user.status === 'Suspended') {
+      return res.status(403).json({ success: false, message: 'Your account is suspended. Please contact bakery support.' });
     }
 
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
-      // Audit log: Failed Login (wrong password)
-      await createAuditLog({
-        req,
-        user,
-        action: 'Failed Login',
-        details: `Invalid password for ${normalizedEmail}`,
-        status: 'Failed',
-        category: 'Authentication'
-      });
-
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid email or password.'
-      });
+      return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }
 
-    // Update lastLogin
     user.lastLogin = new Date();
     await user.save();
 
-    // Audit log: Successful Login
-    await createAuditLog({
-      req,
-      user,
-      action: 'Login',
-      details: 'User logged in successfully',
-      status: 'Success',
-      category: 'Authentication'
-    });
-
-    // Generate JWT & set HttpOnly Cookie
     const token = generateAccessToken(user);
     res.cookie('accessToken', token, getCookieOptions());
 
+    await createAuditLog({
+      user: user._id,
+      userName: user.fullName,
+      role: user.role,
+      action: 'User Login',
+      details: `User logged in: ${user.email} (${user.role})`,
+      category: 'Authentication',
+      status: 'Success',
+      ipAddress: req.ip
+    });
+
     return res.status(200).json({
       success: true,
-      token,
-      message: user.mustChangePassword ? 'Password change required before accessing portal.' : 'Logged in successfully',
-      requiresPasswordChange: !!user.mustChangePassword,
+      message: 'Logged in successfully!',
       user: {
         id: user._id,
+        _id: user._id,
+        email: user.email,
+        fullName: user.fullName,
         firstName: user.firstName,
         lastName: user.lastName,
-        fullName: user.fullName,
-        email: user.email,
+        phone: user.phone,
         role: user.role,
-        isActive: user.isActive,
-        isEmailVerified: user.isEmailVerified,
-        mustChangePassword: !!user.mustChangePassword,
-        lastLogin: user.lastLogin
+        status: user.status
       }
     });
   } catch (error) {
@@ -331,11 +182,100 @@ export const login = async (req, res, next) => {
   }
 };
 
-export const changeInitialPassword = async (req, res, next) => {
+/**
+ * POST /api/auth/logout
+ */
+export const logout = async (req, res) => {
+  res.clearCookie('accessToken', getCookieOptions());
+  return res.status(200).json({
+    success: true,
+    message: 'Logged out successfully.'
+  });
+};
+
+/**
+ * GET /api/auth/me
+ */
+export const getCurrentUser = async (req, res, next) => {
   try {
-    const { newPassword } = req.body;
-    if (!newPassword) {
-      return res.status(400).json({ success: false, message: 'New password is required.' });
+    if (!req.user || !req.user.id) {
+      return res.status(401).json({ success: false, authenticated: false, message: 'Not authenticated.' });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user || !user.isActive) {
+      res.clearCookie('accessToken', getCookieOptions());
+      return res.status(401).json({ success: false, authenticated: false, message: 'User not found or inactive.' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      authenticated: true,
+      user: {
+        id: user._id,
+        _id: user._id,
+        email: user.email,
+        fullName: user.fullName,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        phone: user.phone,
+        role: user.role,
+        status: user.status,
+        addresses: user.addresses || []
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PUT /api/auth/profile
+ */
+export const updateProfile = async (req, res, next) => {
+  try {
+    const { firstName, lastName, fullName, phone, addresses } = req.body;
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    if (firstName) user.firstName = firstName.trim();
+    if (lastName) user.lastName = lastName.trim();
+    if (fullName) user.fullName = fullName.trim();
+    if (phone !== undefined) user.phone = phone.trim();
+    if (Array.isArray(addresses)) user.addresses = addresses;
+
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully.',
+      user: {
+        id: user._id,
+        _id: user._id,
+        email: user.email,
+        fullName: user.fullName,
+        phone: user.phone,
+        role: user.role,
+        addresses: user.addresses
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PUT /api/auth/change-password
+ */
+export const changePassword = async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ success: false, message: 'Current and new password are required.' });
     }
 
     const passwordError = validatePasswordStrength(newPassword);
@@ -345,7 +285,12 @@ export const changeInitialPassword = async (req, res, next) => {
 
     const user = await User.findById(req.user.id).select('+passwordHash');
     if (!user) {
-      return res.status(404).json({ success: false, message: 'User account not found.' });
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(400).json({ success: false, message: 'Incorrect current password.' });
     }
 
     user.passwordHash = newPassword;
@@ -353,609 +298,68 @@ export const changeInitialPassword = async (req, res, next) => {
     user.passwordChangedAt = new Date();
     await user.save();
 
-    // Re-issue clean JWT token without mustChangePassword flag
-    const newAccessToken = generateAccessToken(user);
-    res.cookie('accessToken', newAccessToken, getCookieOptions());
-
-    await createAuditLog({
-      req,
-      user,
-      action: 'Provider Password Changed',
-      details: `User ${user.email} updated initial temporary password to permanent password.`,
-      status: 'Success',
-      category: 'Authentication'
-    });
-
     return res.status(200).json({
       success: true,
-      message: 'Password changed successfully. You can now access your dashboard.',
-      requiresPasswordChange: false,
-      user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        fullName: user.fullName,
-        email: user.email,
-        role: user.role,
-        isActive: user.isActive,
-        mustChangePassword: false
-      }
+      message: 'Password changed successfully.'
     });
   } catch (error) {
     next(error);
   }
 };
 
-export const resetProviderPassword = async (req, res, next) => {
+/**
+ * GET /api/admin/customers
+ */
+export const getAdminCustomers = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const { temporaryPassword } = req.body;
+    const { page = 1, limit = 20, search } = req.query;
+    const query = { role: { $in: ['customer', 'user'] } };
 
-    if (!temporaryPassword) {
-      return res.status(400).json({ success: false, message: 'Temporary password is required.' });
+    if (search && search.trim()) {
+      const regex = new RegExp(search.trim(), 'i');
+      query.$or = [{ fullName: regex }, { email: regex }, { phone: regex }];
     }
 
-    const passwordError = validatePasswordStrength(temporaryPassword);
-    if (passwordError) {
-      return res.status(400).json({ success: false, message: passwordError });
-    }
+    const currentPage = Math.max(1, parseInt(page, 10) || 1);
+    const pageLimit = Math.max(1, Math.min(100, parseInt(limit, 10) || 20));
+    const skip = (currentPage - 1) * pageLimit;
 
-    const provider = await User.findOne({ _id: id, role: 'provider' }).select('+passwordHash');
-    if (!provider) {
-      return res.status(404).json({ success: false, message: 'Cleaner / Provider account not found.' });
-    }
-
-    provider.passwordHash = temporaryPassword;
-    provider.mustChangePassword = true;
-    await provider.save();
-
-    await createAuditLog({
-      req,
-      user: req.user,
-      action: 'Provider Password Reset',
-      details: `Admin reset password for provider '${provider.fullName}' (${provider.email}).`,
-      status: 'Success',
-      category: 'Authentication',
-      metadata: { providerId: provider._id }
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: `Password reset successfully for ${provider.fullName}. They must change it on next login.`
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getCurrentUser = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.user.id);
-    if (!user || !user.isActive) {
-      return res.status(200).json({
-        success: false,
-        authenticated: false,
-        user: null
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      authenticated: true,
-      user: {
-        id: user._id,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        fullName: user.fullName,
-        email: user.email,
-        role: user.role,
-        isActive: user.isActive,
-        isEmailVerified: user.isEmailVerified,
-        lastLogin: user.lastLogin
-      }
-    });
-  } catch (error) {
-    return res.status(200).json({
-      success: false,
-      authenticated: false,
-      user: null
-    });
-  }
-};
-
-export const logout = async (req, res, next) => {
-  try {
-    if (req.user) {
-      await createAuditLog({
-        req,
-        user: req.user,
-        action: 'Logout',
-        details: 'User logged out successfully',
-        status: 'Success',
-        category: 'Authentication'
-      });
-    }
-
-    res.clearCookie('accessToken', {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none'
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: 'Logged out successfully'
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getProfile = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.user.id);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User profile not found.' });
-    }
-
-    res.status(200).json({ success: true, user });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getProviders = async (req, res, next) => {
-  try {
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 20;
-    const skip = (page - 1) * limit;
-
-    const { search, status } = req.query;
-
-    const query = { role: 'provider' };
-
-    if (status && status !== 'All') {
-      query.status = status;
-    }
-
-    if (search && search.trim() !== '') {
-      const searchRegex = new RegExp(search.trim(), 'i');
-      query.$or = [
-        { fullName: searchRegex },
-        { firstName: searchRegex },
-        { lastName: searchRegex },
-        { email: searchRegex },
-        { 'providerDetails.businessName': searchRegex },
-        { 'addresses.street': searchRegex },
-        { 'addresses.city': searchRegex }
-      ];
-    }
-
-    const [providers, total] = await Promise.all([
-      User.find(query)
-        .select('-passwordHash')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
+    const [users, total] = await Promise.all([
+      User.find(query).sort({ createdAt: -1 }).skip(skip).limit(pageLimit).lean(),
       User.countDocuments(query)
     ]);
 
-    const totalPages = Math.ceil(total / limit) || 1;
-
-    res.status(200).json({
-      success: true,
-      count: providers.length,
-      data: {
-        providers,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages,
-          hasNextPage: page < totalPages,
-          hasPreviousPage: page > 1
-        }
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getProviderStats = async (req, res, next) => {
-  try {
-    const [total, active, pending, suspended, rejected] = await Promise.all([
-      User.countDocuments({ role: 'provider' }),
-      User.countDocuments({ role: 'provider', status: 'Active' }),
-      User.countDocuments({ role: 'provider', status: 'Pending' }),
-      User.countDocuments({ role: 'provider', status: 'Suspended' }),
-      User.countDocuments({ role: 'provider', status: 'Rejected' })
-    ]);
-
-    res.status(200).json({
-      success: true,
-      data: {
-        total,
-        active,
-        pending,
-        suspended,
-        rejected
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const getProviderById = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const provider = await User.findOne({ _id: id, role: 'provider' }).select('-passwordHash');
-    if (!provider) {
-      return res.status(404).json({ success: false, message: 'Provider not found' });
-    }
-    res.status(200).json({ success: true, data: provider });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const createProvider = async (req, res, next) => {
-  try {
-    const { name, owner, location, email, phone, status = 'Pending' } = req.body;
-
-    const providerEmail = email || `provider_${Date.now()}@laundry.com`;
-    const normalizedEmail = providerEmail.toLowerCase().trim();
-
-    // Check duplicate
-    const existing = await User.findOne({ email: normalizedEmail });
-    if (existing) {
-      return res.status(409).json({
-        success: false,
-        message: 'A provider/user account with this email address already exists.'
-      });
-    }
-
-    const businessName = name || 'Laundry Provider';
-    const ownerName = owner || 'Provider Owner';
-    const nameParts = ownerName.split(' ');
-
-    const temporaryPassword = req.body.temporaryPassword || 'Password@123';
-    const passwordError = validatePasswordStrength(temporaryPassword);
-    if (passwordError) {
-      return res.status(400).json({ success: false, message: passwordError });
-    }
-
-    const newProvider = await User.create({
-      firstName: nameParts[0] || 'Provider',
-      lastName: nameParts.slice(1).join(' ') || 'Owner',
-      fullName: ownerName,
-      email: normalizedEmail,
-      phone: phone || '+254700000000',
-      passwordHash: temporaryPassword,
-      role: 'provider',
-      status: ['Pending', 'Active', 'Suspended'].includes(status) ? status : 'Pending',
-      mustChangePassword: true,
-      addresses: [{ street: location || 'Nairobi', city: 'Nairobi' }],
-      providerDetails: {
-        businessName,
-        commissionRate: 15,
-        isApproved: status === 'Active',
-        rating: 5.0
-      }
-    });
-
-    await createAuditLog({
-      req,
-      user: req.user,
-      action: 'Cleaner Created',
-      details: `Created cleaner record '${businessName}' (${ownerName}).`,
-      status: 'Success',
-      category: 'Provider'
-    });
-
-    res.status(201).json({ success: true, data: newProvider, message: 'Provider registered successfully' });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const updateProvider = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { name, owner, location, phone } = req.body;
-
-    const provider = await User.findOne({ _id: id, role: 'provider' });
-    if (!provider) {
-      return res.status(404).json({ success: false, message: 'Provider not found' });
-    }
-
-    if (owner) {
-      const nameParts = owner.split(' ');
-      provider.firstName = nameParts[0] || provider.firstName;
-      provider.lastName = nameParts.slice(1).join(' ') || provider.lastName;
-      provider.fullName = owner;
-    }
-
-    if (name) {
-      if (!provider.providerDetails) provider.providerDetails = {};
-      provider.providerDetails.businessName = name;
-    }
-
-    if (phone) provider.phone = phone;
-
-    if (location) {
-      provider.addresses = [{ street: location, city: 'Nairobi' }];
-    }
-
-    await provider.save();
-
-    await createAuditLog({
-      req,
-      user: req.user,
-      action: 'Cleaner Updated',
-      details: `Updated provider details for '${provider.fullName}'.`,
-      status: 'Success',
-      category: 'Provider'
-    });
-
-    res.status(200).json({ success: true, data: provider, message: 'Provider details updated successfully' });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const updateProviderStatus = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-
-    if (!['Active', 'Pending', 'Suspended', 'Rejected'].includes(status)) {
-      return res.status(400).json({ success: false, message: 'Invalid provider status specified.' });
-    }
-
-    const provider = await User.findOneAndUpdate(
-      { _id: id, role: 'provider' },
-      {
-        status,
-        'providerDetails.isApproved': status === 'Active',
-        isActive: status === 'Active'
-      },
-      { new: true }
+    // Enhance users with order counts
+    const enhanced = await Promise.all(
+      users.map(async (u) => {
+        const orderCount = await Order.countDocuments({ customer: u._id });
+        const totalSpentAgg = await Order.aggregate([
+          { $match: { customer: u._id, paymentStatus: 'PAID' } },
+          { $group: { _id: null, total: { $sum: '$pricing.grandTotal' } } }
+        ]);
+        return {
+          ...u,
+          orderCount,
+          totalSpent: totalSpentAgg[0]?.total || 0
+        };
+      })
     );
 
-    if (!provider) {
-      return res.status(404).json({ success: false, message: 'Provider not found' });
-    }
+    const totalPages = Math.ceil(total / pageLimit) || 1;
 
-    const auditActionMap = {
-      Active: 'Cleaner Approved',
-      Suspended: 'Cleaner Suspended',
-      Rejected: 'Cleaner Rejected',
-      Pending: 'Cleaner Status Set to Pending'
-    };
-
-    await createAuditLog({
-      req,
-      user: req.user,
-      action: auditActionMap[status] || 'Provider Status Updated',
-      details: `Updated provider '${provider.fullName}' status to ${status}.`,
-      status: 'Success',
-      category: 'Provider'
-    });
-
-    res.status(200).json({ success: true, data: provider, message: `Provider status updated to ${status}` });
-  } catch (error) {
-    next(error);
-  }
-};
-
-export const deleteProvider = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const provider = await User.findOne({ _id: id, role: { $in: ['provider', 'cleaner'] } });
-    if (!provider) {
-      return res.status(404).json({ success: false, message: 'Cleaner / Provider not found' });
-    }
-
-    // 1. Delete all services created by this cleaner
-    const deletedServices = await Service.deleteMany({ provider: id });
-
-    // 2. Delete all promotion boost requests submitted by this cleaner
-    const deletedPromos = await PromotionRequest.deleteMany({ provider: id });
-
-    // 3. Delete all orders assigned to this cleaner
-    const deletedOrders = await Order.deleteMany({ provider: id });
-
-    // 4. Delete all payment records linked to this cleaner
-    const deletedPayments = await Payment.deleteMany({ provider: id });
-
-    // 5. Delete tickets assigned to or created for this cleaner
-    const deletedTickets = await Ticket.deleteMany({ provider: id });
-
-    // 6. Delete all customer reviews for this cleaner
-    const deletedReviews = await Review.deleteMany({ provider: id });
-
-    // 7. Delete the cleaner user account document
-    await User.findByIdAndDelete(id);
-
-    // 8. PRESERVE AUDIT LOGS (Record permanent deletion event)
-    await createAuditLog({
-      req,
-      user: req.user,
-      action: 'Cleaner Permanently Deleted',
-      details: `Super Admin permanently deleted cleaner '${provider.fullName}' (${provider.email}). Removed ${deletedServices.deletedCount} services, ${deletedPromos.deletedCount} promotion claims, ${deletedOrders.deletedCount} orders, ${deletedPayments.deletedCount} payments, and ${deletedReviews.deletedCount} reviews. Audit logs preserved.`,
-      status: 'Success',
-      category: 'Provider'
-    });
-
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      message: `Cleaner '${provider.fullName}' and all associated services, promotions, reviews, and orders have been permanently removed from the system. Audit logs preserved.`,
-      deletedStats: {
-        services: deletedServices.deletedCount,
-        promotions: deletedPromos.deletedCount,
-        orders: deletedOrders.deletedCount,
-        payments: deletedPayments.deletedCount,
-        tickets: deletedTickets.deletedCount,
-        reviews: deletedReviews.deletedCount
+      data: enhanced,
+      pagination: {
+        page: currentPage,
+        limit: pageLimit,
+        total,
+        totalPages,
+        hasNextPage: currentPage < totalPages,
+        hasPrevPage: currentPage > 1
       }
     });
   } catch (error) {
     next(error);
   }
 };
-
-/**
- * POST /api/auth/deactivate-account
- * Allows authenticated provider/user to voluntarily deactivate their account
- */
-export const deactivateMyAccount = async (req, res, next) => {
-  try {
-    const user = await User.findById(req.user.id);
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    user.isActive = false;
-    user.status = 'Suspended';
-    if (user.providerDetails) {
-      user.providerDetails.isApproved = false;
-    }
-    await user.save();
-
-    await createAuditLog({
-      req,
-      user,
-      action: 'Account Deactivated',
-      details: `${user.fullName} (${user.email}) voluntarily deactivated their account and hidden their services.`,
-      status: 'Success',
-      category: 'Authentication'
-    });
-
-    res.clearCookie('accessToken');
-    return res.status(200).json({
-      success: true,
-      message: 'Your account has been deactivated successfully and your services have been paused from the client homepage.'
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * GET /api/auth/public/providers/:id
- * Public endpoint to fetch cleaner public profile (name, rating, phone, till) for storefront
- */
-export const getPublicProviderProfile = async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const provider = await User.findOne({
-      _id: id,
-      role: { $in: ['provider', 'cleaner'] }
-    }).select('fullName email phone providerDetails');
-
-    if (!provider) {
-      return res.status(404).json({ success: false, message: 'Cleaner profile not found.' });
-    }
-
-    return res.status(200).json({
-      success: true,
-      data: {
-        _id: provider._id,
-        fullName: provider.fullName,
-        businessName: provider.providerDetails?.businessName || provider.fullName,
-        rating: Number(provider.providerDetails?.rating ?? 5.0),
-        reviewsCount: Number(provider.providerDetails?.reviewsCount ?? 0),
-        tillNumber: provider.providerDetails?.tillNumber || '8995354',
-        phone: provider.phone || '',
-        email: provider.email || '',
-        isPromoted: Boolean(provider.providerDetails?.isPromoted),
-        promotionTagline: provider.providerDetails?.promotionTagline || '',
-        paymentChannels: provider.providerDetails?.paymentChannels || []
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * POST /api/auth/otp/request
- * Request phone verification code via SMS
- */
-export const requestOtp = async (req, res, next) => {
-  try {
-    const { phone, purpose = 'login' } = req.body;
-
-    if (!phone) {
-      return res.status(400).json({ success: false, message: 'Phone number is required.' });
-    }
-
-    const result = await requestPhoneOtp({
-      phone,
-      purpose,
-      metadata: { ip: req.ip, userAgent: req.headers['user-agent'] }
-    });
-
-    if (!result.success) {
-      return res.status(400).json(result);
-    }
-
-    await createAuditLog({
-      req,
-      action: 'OTP_REQUESTED',
-      details: `OTP requested for ${maskPhoneNumber(phone)} [Purpose: ${purpose}]`,
-      status: 'Success',
-      category: 'Auth'
-    });
-
-    return res.status(200).json(result);
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * POST /api/auth/otp/verify
- * Verify phone verification code and optionally log in or verify user
- */
-export const verifyOtp = async (req, res, next) => {
-  try {
-    const { phone, otp, purpose = 'login' } = req.body;
-
-    if (!phone || !otp) {
-      return res.status(400).json({
-        success: false,
-        message: 'Phone number and verification code are required.'
-      });
-    }
-
-    const result = await verifyPhoneOtp({ phone, otp, purpose });
-
-    if (!result.success) {
-      await createAuditLog({
-        req,
-        action: 'OTP_VERIFICATION_FAILED',
-        details: `Failed OTP verification attempt for ${maskPhoneNumber(phone)}: ${result.message}`,
-        status: 'Failed',
-        category: 'Auth'
-      });
-      return res.status(400).json(result);
-    }
-
-    await createAuditLog({
-      req,
-      action: 'OTP_VERIFIED',
-      details: `Successful OTP verification for ${maskPhoneNumber(phone)} [Purpose: ${purpose}]`,
-      status: 'Success',
-      category: 'Auth'
-    });
-
-    return res.status(200).json(result);
-  } catch (error) {
-    next(error);
-  }
-};
-

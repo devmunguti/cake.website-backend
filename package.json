@@ -1,21 +1,23 @@
 {
-  "name": "laundry-platform-backend",
+  "name": "cake-bakery-backend",
   "version": "1.0.0",
-  "description": "Node.js Express Backend API for Laundry Platform",
+  "description": "Node.js Express Backend API for Single-Owner Cake Baking and Ordering Platform",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "seed": "node src/seed/seedData.js",
-    "seed:admin": "node src/seed/seedAdmin.js"
+    "seed": "node src/seed/seedBakeryData.js",
+    "seed:bakery": "node src/seed/seedBakeryData.js"
   },
   "keywords": [
-    "laundry",
+    "cake",
+    "bakery",
     "express",
     "nodejs",
     "api"
   ],
+
   "author": "",
   "license": "ISC",
   "dependencies": {

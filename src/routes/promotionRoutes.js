@@ -1,30 +1,23 @@
 import express from 'express';
 import {
-  getPromotionSettings,
-  requestPromotion,
-  getMyPromotionRequests,
-  getFeaturedProviders,
+  validatePromotion,
+  getPromotions,
   getAdminPromotions,
-  approvePromotion,
-  rejectPromotion,
-  updatePromotionSettings
+  createPromotion,
+  deletePromotion
 } from '../controllers/promotionController.js';
 import { authenticate, authorizeRoles } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
-// Public Endpoints
-router.get('/settings', getPromotionSettings);
-router.get('/featured', getFeaturedProviders);
+// Public
+router.post('/validate', validatePromotion);
+router.get('/active', getPromotions);
+router.get('/', getPromotions);
 
-// Provider Authenticated Endpoints
-router.post('/request', authenticate, authorizeRoles('provider', 'cleaner', 'admin'), requestPromotion);
-router.get('/my-requests', authenticate, authorizeRoles('provider', 'cleaner', 'admin'), getMyPromotionRequests);
-
-// Admin Management Endpoints
-router.get('/admin', authenticate, authorizeRoles('admin'), getAdminPromotions);
-router.patch('/admin/:id/approve', authenticate, authorizeRoles('admin'), approvePromotion);
-router.patch('/admin/:id/reject', authenticate, authorizeRoles('admin'), rejectPromotion);
-router.put('/admin/settings', authenticate, authorizeRoles('admin'), updatePromotionSettings);
+// Admin
+router.get('/admin/all', authenticate, authorizeRoles('admin'), getAdminPromotions);
+router.post('/admin', authenticate, authorizeRoles('admin'), createPromotion);
+router.delete('/admin/:id', authenticate, authorizeRoles('admin'), deletePromotion);
 
 export default router;

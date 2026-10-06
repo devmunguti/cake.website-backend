@@ -1,63 +1,27 @@
-import { Router } from 'express';
+import express from 'express';
 import {
-  getPaymentRecords,
-  getPaymentMetrics,
-  getPaymentById,
-  settlePaymentPayout,
-  processBulkPayouts,
-  exportPaymentRecords,
-  requestProviderPayout,
-  checkoutOrderPayment,
+  initiatePayment,
+  handlePayheroCallback,
   getPaymentStatus,
-  handlePayHeroCallback,
-  retryOrderPayment,
-  getMyPayments,
-  getProviderPayments,
-  updateProviderPayoutSettings,
-  getProviderPaymentChannels,
-  addPaymentChannel,
-  deletePaymentChannel,
-  confirmManualPayment,
-  verifyManualPayment,
-  sendPaymentPayoutInvoice,
-  sendBulkPayoutInvoices
+  getAdminPayments,
+  verifyPaymentManual
 } from '../controllers/paymentController.js';
-import { authenticate, optionalAuthenticate } from '../middleware/authMiddleware.js';
-import { authorizeRoles } from '../middleware/roleMiddleware.js';
+import { authenticate, authorizeRoles, optionalAuthenticate } from '../middleware/authMiddleware.js';
 
-const router = Router();
+const router = express.Router();
 
-// Public Webhook callback from PayHero (Unauthenticated as PayHero sends HTTP callbacks)
-router.post('/payhero/callback', handlePayHeroCallback);
+// Customer payment endpoints
+router.post('/initiate', optionalAuthenticate, initiatePayment);
+router.post('/stkpush', optionalAuthenticate, initiatePayment);
+router.get('/status/:orderId', getPaymentStatus);
 
-// Customer Checkout & Status Polling (Supports Guest Customers without requiring login)
-router.post('/checkout', optionalAuthenticate, checkoutOrderPayment);
-router.post('/confirm-manual', optionalAuthenticate, confirmManualPayment);
-router.post('/verify-manual', optionalAuthenticate, verifyManualPayment);
-router.get('/:paymentId/status', optionalAuthenticate, getPaymentStatus);
-router.post('/:id/retry', optionalAuthenticate, retryOrderPayment);
-router.get('/my-payments', authenticate, authorizeRoles('customer', 'user'), getMyPayments);
+// Webhooks
+router.post('/payhero/callback', handlePayheroCallback);
+router.post('/callback', handlePayheroCallback);
 
-// Provider Earnings & Payout Settings
-router.get('/provider', authenticate, authorizeRoles('provider', 'cleaner', 'admin'), getProviderPayments);
-router.put('/provider/payout-settings', authenticate, authorizeRoles('provider', 'cleaner'), updateProviderPayoutSettings);
-router.post('/request-payout', authenticate, authorizeRoles('provider', 'cleaner', 'admin'), requestProviderPayout);
-
-// Provider Payment Channels Management
-router.get('/channels', authenticate, authorizeRoles('provider', 'cleaner', 'user', 'admin'), getProviderPaymentChannels);
-router.post('/channels', authenticate, authorizeRoles('provider', 'cleaner', 'user', 'admin'), addPaymentChannel);
-router.delete('/channels/:channelId', authenticate, authorizeRoles('provider', 'cleaner', 'user', 'admin'), deletePaymentChannel);
-
-// Admin payment ledger endpoints
-router.get('/', authenticate, authorizeRoles('admin'), getPaymentRecords);
-router.get('/metrics', authenticate, authorizeRoles('admin'), getPaymentMetrics);
-router.get('/export', authenticate, authorizeRoles('admin'), exportPaymentRecords);
-router.post('/process-payouts', authenticate, authorizeRoles('admin'), processBulkPayouts);
-router.post('/bulk-send-invoices', authenticate, authorizeRoles('admin'), sendBulkPayoutInvoices);
-router.get('/:id', authenticate, authorizeRoles('admin'), getPaymentById);
-router.post('/:id/settle-payout', authenticate, authorizeRoles('admin'), settlePaymentPayout);
-router.post('/:id/send-payout-invoice', authenticate, authorizeRoles('admin'), sendPaymentPayoutInvoice);
+// Admin endpoints
+router.get('/admin/records', authenticate, authorizeRoles('admin'), getAdminPayments);
+router.get('/admin/all', authenticate, authorizeRoles('admin'), getAdminPayments);
+router.post('/admin/manual-verify', authenticate, authorizeRoles('admin'), verifyPaymentManual);
 
 export default router;
-
-

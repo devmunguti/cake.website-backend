@@ -1,30 +1,22 @@
 import express from 'express';
 import {
-  submitReview,
-  getProviderReviews,
+  getReviews,
+  createReview,
   replyToReview,
-  getReviewByOrderRef,
-  getPublicProviderReviews,
-  getProviderRankingsAndDirectory
+  togglePublishReview,
+  deleteReview
 } from '../controllers/reviewController.js';
-import { authenticate, optionalAuthenticate, authorizeRoles } from '../middleware/authMiddleware.js';
+import { authenticate, authorizeRoles, optionalAuthenticate } from '../middleware/authMiddleware.js';
 
 const router = express.Router();
 
-// Public Customer-Facing Directory & Cleaner Rankings
-router.get('/directory', getProviderRankingsAndDirectory);
+// Public
+router.get('/', getReviews);
+router.post('/', optionalAuthenticate, createReview);
 
-// Public / Customer review submission
-router.post('/', optionalAuthenticate, submitReview);
-
-// Check if order has been reviewed
-router.get('/order/:orderRef', getReviewByOrderRef);
-
-// Public provider reviews
-router.get('/public/:providerId', getPublicProviderReviews);
-
-// Cleaner portal routes (Authenticated Provider/Cleaner only)
-router.get('/provider', authenticate, authorizeRoles('provider', 'cleaner'), getProviderReviews);
-router.post('/:id/reply', authenticate, authorizeRoles('provider', 'cleaner'), replyToReview);
+// Admin
+router.patch('/:id/reply', authenticate, authorizeRoles('admin'), replyToReview);
+router.patch('/:id/toggle-publish', authenticate, authorizeRoles('admin'), togglePublishReview);
+router.delete('/:id', authenticate, authorizeRoles('admin'), deleteReview);
 
 export default router;

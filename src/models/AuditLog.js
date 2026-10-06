@@ -42,14 +42,14 @@ const auditLogSchema = new mongoose.Schema(
       enum: [
         'Authentication',
         'User Management',
+        'Cake Management',
+        'Category Management',
         'Order',
         'Payment',
-        'Provider',
-        'Driver',
-        'System',
-        'Security',
-        'Backup',
+        'Custom Cake',
+        'Promotion',
         'Settings',
+        'Security',
         'Admin',
         'Other'
       ],
@@ -73,21 +73,17 @@ const auditLogSchema = new mongoose.Schema(
   }
 );
 
-// Indexes optimized for date ranges, filtering, & searching
 auditLogSchema.index({ createdAt: -1 });
 auditLogSchema.index({ user: 1, createdAt: -1 });
 auditLogSchema.index({ status: 1, createdAt: -1 });
 auditLogSchema.index({ action: 1, createdAt: -1 });
 auditLogSchema.index({ category: 1, createdAt: -1 });
-auditLogSchema.index({ ipAddress: 1, createdAt: -1 });
 
-// Text index for fast multi-field searching
 auditLogSchema.index({
   userName: 'text',
   role: 'text',
   action: 'text',
-  details: 'text',
-  ipAddress: 'text'
+  details: 'text'
 });
 
 const AuditLog = mongoose.models.AuditLog || mongoose.model('AuditLog', auditLogSchema);

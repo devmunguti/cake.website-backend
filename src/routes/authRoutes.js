@@ -1,52 +1,28 @@
-import { Router } from 'express';
+import express from 'express';
 import {
   register,
   login,
   logout,
   getCurrentUser,
-  getProfile,
-  getProviders,
-  getProviderStats,
-  getProviderById,
-  createProvider,
-  updateProvider,
-  updateProviderStatus,
-  deleteProvider,
-  changeInitialPassword,
-  resetProviderPassword,
-  deactivateMyAccount,
-  getPublicProviderProfile,
-  requestOtp,
-  verifyOtp
+  updateProfile,
+  changePassword,
+  getAdminCustomers
 } from '../controllers/authController.js';
-import { authenticate } from '../middleware/authMiddleware.js';
-import { authorizeRoles } from '../middleware/roleMiddleware.js';
-import { loginLimiter, otpLimiter } from '../middleware/rateLimiter.js';
+import { authenticate, authorizeRoles } from '../middleware/authMiddleware.js';
 
-const router = Router();
+const router = express.Router();
 
-// Public Cleaner Profile Endpoint
-router.get('/public/providers/:id', getPublicProviderProfile);
-
-// Core Authentication Endpoints
+// Public
 router.post('/register', register);
-router.post('/login', loginLimiter, login);
+router.post('/login', login);
 router.post('/logout', logout);
-router.post('/otp/request', otpLimiter, requestOtp);
-router.post('/otp/verify', otpLimiter, verifyOtp);
-router.get('/me', authenticate, getCurrentUser);
-router.get('/profile', authenticate, getProfile);
-router.post('/change-initial-password', authenticate, changeInitialPassword);
-router.post('/deactivate-account', authenticate, deactivateMyAccount);
 
-// Provider Management Endpoints
-router.get('/providers', authenticate, authorizeRoles('admin'), getProviders);
-router.get('/providers/stats', authenticate, authorizeRoles('admin'), getProviderStats);
-router.get('/providers/:id', authenticate, authorizeRoles('admin'), getProviderById);
-router.post('/providers', authenticate, authorizeRoles('admin'), createProvider);
-router.patch('/providers/:id', authenticate, authorizeRoles('admin'), updateProvider);
-router.patch('/providers/:id/status', authenticate, authorizeRoles('admin'), updateProviderStatus);
-router.patch('/providers/:id/reset-password', authenticate, authorizeRoles('admin'), resetProviderPassword);
-router.delete('/providers/:id', authenticate, authorizeRoles('admin'), deleteProvider);
+// Authenticated user
+router.get('/me', authenticate, getCurrentUser);
+router.put('/profile', authenticate, updateProfile);
+router.put('/change-password', authenticate, changePassword);
+
+// Admin
+router.get('/customers', authenticate, authorizeRoles('admin'), getAdminCustomers);
 
 export default router;
